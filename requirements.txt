@@ -19,6 +19,8 @@ openai>=1.3.0
 
 #Slack integration
 slack-bolt==1.18.0
+slackclient
+slackeventsapi
 
 #Database
 psycopg2-binary==2.9.9
