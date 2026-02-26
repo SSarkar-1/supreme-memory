@@ -12,7 +12,16 @@ import csv
 import io
 import uuid
 import json
+import time
+import hashlib
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime
 load_dotenv()
+
+# Use non-interactive backend for matplotlib in headless environment
+import matplotlib
+matplotlib.use('Agg')
 
 app=FastAPI(title="AI Slack Bot")
 
@@ -20,6 +29,11 @@ app=FastAPI(title="AI Slack Bot")
 last_query_cache = {}
 # In-memory cache for CSV files
 csv_cache = {}
+# In-memory cache for chart images
+chart_cache = {}
+# TTL cache for LLM query results (300 seconds)
+query_cache = {}
+QUERY_CACHE_TTL = 300  # 5 minutes
 
 system_prompt='''You are a PostgreSQL SQL generator.
 You have access to exactly ONE table:
@@ -53,7 +67,9 @@ Instructions:
 
 Return only the SQL statement.
 If the question cannot be answered using this table, return  short message as to why query is not supported in the format:
-SELECT 'Query not supported:{reason query not supported}' AS message;'''
+SELECT 'Query not supported:{reason query not supported}' AS message;
+If the Question asks to update,alter,delete,insert,drop,create data in the database, do not do thus and instead return short message
+SELECT 'Query not supported:Database cannot be altered' AS message; '''
 
 agent=create_agent(
     model="gpt-5-nano",
@@ -61,6 +77,22 @@ agent=create_agent(
     )
 
 def get_response(user_message):
+    # Check cache first
+    question_hash = hashlib.md5(user_message.lower().strip().encode()).hexdigest()
+    current_time = time.time()
+    
+    # Check if query is in cache and not expired
+    if question_hash in query_cache:
+        cached_entry = query_cache[question_hash]
+        age = current_time - cached_entry["timestamp"]
+        if age < QUERY_CACHE_TTL:
+            print(f"Cache hit! Using cached result (age: {age:.1f}s)")
+            return cached_entry["result"]
+        else:
+            # Cache expired, remove it
+            del query_cache[question_hash]
+    
+    # Cache miss or expired, proceed with LLM call
     question=HumanMessage(content=[
         {"type":"text","text": user_message }
         ])
@@ -91,7 +123,15 @@ def get_response(user_message):
         columns = [desc[0] for desc in cur.description]
         data = [dict(zip(columns, row)) for row in rows]
         print(data)
-        return data, columns
+        
+        # Cache the result
+        result = (data, columns)
+        query_cache[question_hash] = {
+            "result": result,
+            "timestamp": current_time
+        }
+        
+        return result
     except Exception as error:
         return error, None
     finally:
@@ -101,7 +141,81 @@ def get_response(user_message):
             conn.close()
 
 
-def process_query(text: str, response_url: str):
+def generate_and_upload_chart(data, columns, channel_id):
+    """
+    Generate a chart from data with date column and upload to Slack
+    Returns the image URL for embedding in Slack message
+    """
+    try:
+        # Find date column and numeric columns
+        date_col = None
+        numeric_cols = []
+        
+        for col in columns:
+            if col.lower() == 'date':
+                date_col = col
+            # Check if column contains numeric data
+            if all(isinstance(row.get(col), (int, float)) or row.get(col) is None for row in data):
+                numeric_cols.append(col)
+        
+        if not date_col or not numeric_cols:
+            return None
+        
+        # Prepare data for charting
+        dates = []
+        for row in data:
+            date_val = row.get(date_col)
+            if isinstance(date_val, str):
+                try:
+                    dates.append(datetime.strptime(date_val, '%Y-%m-%d'))
+                except:
+                    dates.append(date_val)
+            else:
+                dates.append(date_val)
+        
+        # Create figure with subplots if multiple numeric columns
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        # Plot each numeric column
+        for col in numeric_cols[:3]:  # Limit to 3 columns for clarity
+            values = [row.get(col, 0) for row in data]
+            ax.plot(dates, values, marker='o', label=col, linewidth=2)
+        
+        ax.set_xlabel('Date', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Value', fontsize=12, fontweight='bold')
+        ax.set_title('Query Results Over Time', fontsize=14, fontweight='bold')
+        ax.legend(loc='best')
+        ax.grid(True, alpha=0.3)
+        
+        # Format x-axis dates
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        
+        # Save to BytesIO
+        img_buffer = io.BytesIO()
+        plt.savefig(img_buffer, format='png', dpi=100, bbox_inches='tight')
+        img_buffer.seek(0)
+        plt.close(fig)
+        
+        # Store chart image in cache instead of uploading to Slack
+        chart_id = str(uuid.uuid4())
+        chart_cache[chart_id] = {
+            "image_data": img_buffer.getvalue(),
+            "filename": f"chart_{chart_id}.png"
+        }
+        
+        # Get base URL from environment
+        base_url = os.environ.get("BASE_URL", "http://localhost:8000")
+        image_url = f"{base_url}/chart-image/{chart_id}"
+        print(f"Chart generated and cached: {image_url}")
+        return image_url
+    except Exception as e:
+        print(f"Chart generation failed: {str(e)}")
+        return None
+
+
+def process_query(text: str, response_url: str, channel_id: str = None):
     try:
         result = get_response(text)
         if isinstance(result, tuple) and len(result) == 2:
@@ -111,16 +225,33 @@ def process_query(text: str, response_url: str):
             data = result
             columns = None
         
+        chart_image_url = None
+        
         if columns and isinstance(data, list) and data:
             # Check if query is not supported
             is_unsupported = (len(columns) == 1 and columns[0] == "message" and 
                             "Query not supported:" in str(data[0].get("message", "")))
             
-            # Format as markdown table
+            # Check if date column exists and generate chart
+            has_date_column = 'date' in columns
+            if has_date_column and not is_unsupported and channel_id:
+                try:
+                    chart_image_url = generate_and_upload_chart(data, columns, channel_id)
+                except Exception as chart_error:
+                    print(f"Chart generation error: {str(chart_error)}")
+                    # Continue without chart if generation fails
+            
+            total_rows = len(data)
+            display_limit = 10
+            
+            # Prepare data for display (limit to 10 rows)
+            display_data = data[:display_limit]
+            
+            # Format as markdown table for display
             header = "| " + " | ".join(columns) + " |"
             # separator = "| " + " | ".join(["---"] * len(columns)) + " |"
             rows = []
-            for row in data:
+            for row in display_data:
                 row_str = "| " + " | ".join([str(row[col]) for col in columns]) + " |"
                 rows.append(row_str)
             response_text = "\n".join([header] + rows)
@@ -140,39 +271,79 @@ def process_query(text: str, response_url: str):
                     ]
                 }
             else:
-                # Cache the query result
+                # Cache the query result (all rows for export)
                 cache_id = str(uuid.uuid4())
                 last_query_cache[cache_id] = {
                     "data": data,
                     "columns": columns
                 }
                 
+                # Build blocks array
+                blocks = []
+                
+                # Add row count info
+                if total_rows > display_limit:
+                    info_text = f"📊 Query result - Showing {display_limit} of {total_rows} rows"
+                else:
+                    info_text = f"📊 Query result - {total_rows} row(s)"
+                
+                blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": info_text
+                    }
+                })
+                
+                # Add chart if available
+                if chart_image_url:
+                    blocks.append({
+                        "type": "image",
+                        "image_url": chart_image_url,
+                        "alt_text": "Query Result Chart"
+                    })
+                
+                # Add table
+                blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"```{response_text}```"
+                    }
+                })
+                
+                # Add note if rows are limited
+                if total_rows > display_limit:
+                    blocks.append({
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": f" Showing first {display_limit} rows. Click 'Export as CSV' to download all {total_rows} rows."
+                            }
+                        ]
+                    })
+                
+                # Add export button
+                blocks.append({
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "📥 Export as CSV"
+                            },
+                            "action_id": f"export_csv_{cache_id}",
+                            "value": cache_id
+                        }
+                    ]
+                })
+                
                 # Create payload with button
                 payload = {
                     "response_type": "in_channel",
-                    "blocks": [
-                        {
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": f"📊 Query result:\n```{response_text}```"
-                            }
-                        },
-                        {
-                            "type": "actions",
-                            "elements": [
-                                {
-                                    "type": "button",
-                                    "text": {
-                                        "type": "plain_text",
-                                        "text": "📥 Export as CSV"
-                                    },
-                                    "action_id": f"export_csv_{cache_id}",
-                                    "value": cache_id
-                                }
-                            ]
-                        }
-                    ]
+                    "blocks": blocks
                 }
         elif isinstance(data, list) and not data:
             response_text = "No data found for your query."
@@ -196,7 +367,7 @@ def process_query(text: str, response_url: str):
 
 @app.post("/ask-data")
 async def get_data(background_tasks: BackgroundTasks,text: str = Form(...),user_id: str = Form(...),channel_id: str = Form(...), response_url: str = Form(...)):
-    background_tasks.add_task(process_query, text, response_url)
+    background_tasks.add_task(process_query, text, response_url, channel_id)
     return {
         "response_type": "ephemeral",
         "text": "Processing your query..."
@@ -291,6 +462,30 @@ async def download_csv(file_id: str):
             return {"error": "File not found or already downloaded"}
     except Exception as e:
         print(f"Error downloading CSV: {str(e)}")
+        return {"error": str(e)}
+
+@app.get("/chart-image/{chart_id}")
+async def get_chart_image(chart_id: str):
+    """
+    Serve chart image by ID
+    """
+    try:
+        if chart_id in chart_cache:
+            chart_data = chart_cache[chart_id]
+            image_data = chart_data["image_data"]
+            filename = chart_data["filename"]
+            
+            # Don't delete - keep for Slack to download
+            # Return image for embedding in Slack
+            return StreamingResponse(
+                iter([image_data]),
+                media_type="image/png",
+                headers={"Content-Disposition": f"inline; filename={filename}"}
+            )
+        else:
+            return {"error": "Chart not found"}
+    except Exception as e:
+        print(f"Error serving chart: {str(e)}")
         return {"error": str(e)}
 
     
