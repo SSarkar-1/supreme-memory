@@ -2,10 +2,12 @@ from langchain.agents import create_agent
 from langchain.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 import psycopg2
-from fastapi import FastAPI
+from fastapi import FastAPI,Form,BackgroundTasks
+from fastapi.responses import JSONResponse
 import uvicorn
 import os
 from dotenv import load_dotenv
+import requests
 load_dotenv()
 
 app=FastAPI(title="AI Slack Bot")
@@ -47,9 +49,7 @@ agent=create_agent(
     model="gpt-5-nano",
     system_prompt=system_prompt,
     )
-
-@app.get("/ask-data")
-async def get_data(user_message):
+def get_response(user_message):
     question=HumanMessage(content=[
         {"type":"text","text": user_message }
         ])
@@ -87,6 +87,36 @@ async def get_data(user_message):
         if conn:
             conn.close()
 
+
+def process_query(text: str, response_url: str):
+    try:
+        data = get_response(text)
+        # Format the data as a string
+        if isinstance(data, list):
+            response_text = "\n".join([str(row) for row in data])
+        else:
+            response_text = str(data)
+        payload = {
+            "response_type": "in_channel",
+            "text": f"Query result:\n{response_text}"
+        }
+        requests.post(response_url, json=payload)
+    except Exception as e:
+        payload = {
+            "response_type": "ephemeral",
+            "text": f"Error processing query: {str(e)}"
+        }
+        requests.post(response_url, json=payload)
+
+@app.post("/ask-data")
+async def get_data(background_tasks: BackgroundTasks,text: str = Form(...),user_id: str = Form(...),channel_id: str = Form(...), response_url: str = Form(...)):
+    background_tasks.add_task(process_query, text, response_url)
+    return {
+        "response_type": "ephemeral",
+        "text": "Processing your query..."
+    }
+
+    
 if __name__ == "__main__":
     # For production, use environment variable PORT (set by hosting platforms)
     port = int(os.environ.get("PORT", 8000))
