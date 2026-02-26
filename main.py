@@ -3,14 +3,24 @@ from langchain.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 import psycopg2
 from fastapi import FastAPI,Form,BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 import uvicorn
 import os
 from dotenv import load_dotenv
 import requests
+import csv
+import io
+import uuid
+import json
 load_dotenv()
 
 app=FastAPI(title="AI Slack Bot")
+
+# In-memory cache for last query results
+last_query_cache = {}
+# In-memory cache for CSV files
+csv_cache = {}
+
 system_prompt='''You are a PostgreSQL SQL generator.
 You have access to exactly ONE table:
 
@@ -102,6 +112,10 @@ def process_query(text: str, response_url: str):
             columns = None
         
         if columns and isinstance(data, list) and data:
+            # Check if query is not supported
+            is_unsupported = (len(columns) == 1 and columns[0] == "message" and 
+                            "Query not supported:" in str(data[0].get("message", "")))
+            
             # Format as markdown table
             header = "| " + " | ".join(columns) + " |"
             # separator = "| " + " | ".join(["---"] * len(columns)) + " |"
@@ -110,15 +124,68 @@ def process_query(text: str, response_url: str):
                 row_str = "| " + " | ".join([str(row[col]) for col in columns]) + " |"
                 rows.append(row_str)
             response_text = "\n".join([header] + rows)
+            
+            if is_unsupported:
+                # Don't create CSV for unsupported queries
+                payload = {
+                    "response_type": "in_channel",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"⚠️ Query Error:\n```{response_text}```"
+                            }
+                        }
+                    ]
+                }
+            else:
+                # Cache the query result
+                cache_id = str(uuid.uuid4())
+                last_query_cache[cache_id] = {
+                    "data": data,
+                    "columns": columns
+                }
+                
+                # Create payload with button
+                payload = {
+                    "response_type": "in_channel",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"📊 Query result:\n```{response_text}```"
+                            }
+                        },
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": {
+                                        "type": "plain_text",
+                                        "text": "📥 Export as CSV"
+                                    },
+                                    "action_id": f"export_csv_{cache_id}",
+                                    "value": cache_id
+                                }
+                            ]
+                        }
+                    ]
+                }
         elif isinstance(data, list) and not data:
             response_text = "No data found for your query."
+            payload = {
+                "response_type": "in_channel",
+                "text": response_text
+            }
         else:
-            response_text = str(data)
+            payload = {
+                "response_type": "in_channel",
+                "text": str(data)
+            }
         
-        payload = {
-            "response_type": "in_channel",
-            "text": f"📊 Query result:\n{response_text}"
-        }
         requests.post(response_url, json=payload)
     except Exception as e:
         payload = {
@@ -134,6 +201,97 @@ async def get_data(background_tasks: BackgroundTasks,text: str = Form(...),user_
         "response_type": "ephemeral",
         "text": "Processing your query..."
     }
+
+@app.post("/slack/interactive")
+async def handle_slack_interaction(payload: str = Form(...)):
+    """
+    Handle Slack interactive button clicks
+    Slack sends the payload as form-encoded data
+    """
+    try:
+        # Parse the JSON payload from the form data
+        payload_data = json.loads(payload)
+        actions = payload_data.get("actions", [{}])
+        action_id = actions[0].get("action_id", "")
+        
+        if action_id.startswith("export_csv_"):
+            cache_id = action_id.split("export_csv_")[1]
+            
+            if cache_id in last_query_cache:
+                cached = last_query_cache[cache_id]
+                data = cached["data"]
+                columns = cached["columns"]
+                
+                # Generate CSV in memory
+                output = io.StringIO()
+                writer = csv.DictWriter(output, fieldnames=columns)
+                writer.writeheader()
+                writer.writerows(data)
+                csv_content = output.getvalue()
+                
+                # Store CSV in cache with unique ID
+                csv_file_id = str(uuid.uuid4())
+                csv_cache[csv_file_id] = {
+                    "filename": f"query_results_{csv_file_id}.csv",
+                    "content": csv_content
+                }
+                
+                # Send message with download link
+                response_url = payload_data.get("response_url")
+                # Get the base URL from the request (you may need to set this as env variable)
+                base_url = os.environ.get("BASE_URL")
+                download_link = f"{base_url}/download-csv/{csv_file_id}"
+                
+                requests.post(response_url, json={
+                    "response_type": "ephemeral",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"✅ CSV file ready with {len(data)} rows\n<{download_link}|📥 Download CSV>"
+                            }
+                        }
+                    ]
+                })
+                
+                # Clean up query cache
+                del last_query_cache[cache_id]
+                
+                return {"ok": True}
+            else:
+                return {"ok": False, "error": "Cache expired"}
+        
+        return {"ok": False}
+    except Exception as e:
+        print(f"Error handling interaction: {str(e)}")
+        return {"ok": False, "error": str(e)}
+
+@app.get("/download-csv/{file_id}")
+async def download_csv(file_id: str):
+    """
+    Download CSV file by ID
+    """
+    try:
+        if file_id in csv_cache:
+            csv_data = csv_cache[file_id]
+            filename = csv_data["filename"]
+            content = csv_data["content"]
+            
+            # Clean up cache
+            del csv_cache[file_id]
+            
+            # Return CSV as downloadable file using StreamingResponse
+            return StreamingResponse(
+                iter([content]),
+                media_type="text/csv",
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
+            )
+        else:
+            return {"error": "File not found or already downloaded"}
+    except Exception as e:
+        print(f"Error downloading CSV: {str(e)}")
+        return {"error": str(e)}
 
     
 if __name__ == "__main__":
