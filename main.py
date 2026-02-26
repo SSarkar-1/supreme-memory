@@ -49,6 +49,7 @@ agent=create_agent(
     model="gpt-5-nano",
     system_prompt=system_prompt,
     )
+
 def get_response(user_message):
     question=HumanMessage(content=[
         {"type":"text","text": user_message }
@@ -77,10 +78,12 @@ def get_response(user_message):
         # query='SELECT * FROM sales_daily'
         cur.execute(agent_query)
         rows = cur.fetchall()
-        print(rows)
-        return rows
+        columns = [desc[0] for desc in cur.description]
+        data = [dict(zip(columns, row)) for row in rows]
+        print(data)
+        return data, columns
     except Exception as error:
-        return error
+        return error, None
     finally:
         if cur:
             cur.close()
@@ -90,15 +93,31 @@ def get_response(user_message):
 
 def process_query(text: str, response_url: str):
     try:
-        data = get_response(text)
-        # Format the data as a string
-        if isinstance(data, list):
-            response_text = "\n".join([str(row) for row in data])
+        result = get_response(text)
+        if isinstance(result, tuple) and len(result) == 2:
+            data, columns = result
+        else:
+            # Error case
+            data = result
+            columns = None
+        
+        if columns and isinstance(data, list) and data:
+            # Format as markdown table
+            header = "| " + " | ".join(columns) + " |"
+            # separator = "| " + " | ".join(["---"] * len(columns)) + " |"
+            rows = []
+            for row in data:
+                row_str = "| " + " | ".join([str(row[col]) for col in columns]) + " |"
+                rows.append(row_str)
+            response_text = "\n".join([header] + rows)
+        elif isinstance(data, list) and not data:
+            response_text = "No data found for your query."
         else:
             response_text = str(data)
+        
         payload = {
             "response_type": "in_channel",
-            "text": f"Query result:\n{response_text}"
+            "text": f"📊 Query result:\n{response_text}"
         }
         requests.post(response_url, json=payload)
     except Exception as e:
