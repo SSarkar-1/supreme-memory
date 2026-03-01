@@ -50,7 +50,7 @@ Columns:
 
 Instructions:
 
-1. Generate ONLY a single valid PostgreSQL SELECT query.
+1. Generate ONLY a single valid PostgreSQL SELECT query and DO NOT PUT SEMICOLON AT THE END.
 2. Do NOT include explanations.
 3. Do NOT include markdown formatting.
 4. Do NOT include comments.
@@ -76,6 +76,21 @@ agent=create_agent(
     system_prompt=system_prompt,
     )
 
+
+def validate_user_input(text: str):
+    """Basic filtering of user prompt to avoid SQL injection or malicious content.
+
+    This runs before sending the message to the LLM. It flags obvious
+    SQL keywords or semicolons which are not needed in natural language
+    questions and could be used to manipulate the agent.
+    """
+    lowered = text.lower()
+    forbidden = [';', 'drop ', 'delete ', 'insert ', 'update ', 'alter ', 'truncate ', 'create ']
+    for token in forbidden:
+        if token in lowered:
+            raise ValueError("User input contains forbidden token: %s" % token.strip())
+    return True
+
 def get_response(user_message):
     # Check cache first
     question_hash = hashlib.md5(user_message.lower().strip().encode()).hexdigest()
@@ -92,6 +107,12 @@ def get_response(user_message):
             # Cache expired, remove it
             del query_cache[question_hash]
     
+    # basic user message validation
+    try:
+        validate_user_input(user_message)
+    except ValueError as ve:
+        return f"Input validation failed: {ve}", None
+
     # Cache miss or expired, proceed with LLM call
     question=HumanMessage(content=[
         {"type":"text","text": user_message }
