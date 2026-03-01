@@ -100,11 +100,11 @@ def get_response(user_message):
     agent_query=response['messages'][-1].content
 
 
-    hostname='localhost'
-    database='analytics'
-    username='postgres'
-    pwd='ss29320#'
-    port_id=5432
+    hostname = os.getenv("DB_HOST")
+    database = os.getenv("DB_NAME")
+    username = os.getenv("DB_USER")
+    pwd = os.getenv("DB_PASSWORD")
+    port_id = int(os.getenv("DB_PORT", 5432))
     conn=None
     cur=None
     try:
