@@ -27,3 +27,4 @@ slackeventsapi
 #Database
 psycopg2-binary==2.9.9
 SQLAlchemy==2.0.32
+pglast>=2.8.0
